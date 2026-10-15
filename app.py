@@ -205,6 +205,10 @@ class SQLiteStore:
             c.execute("DELETE FROM users WHERE username = ?", (username,))
             c.commit()
 
+    def list_users(self):
+        with closing(self._conn()) as c:
+            return [dict(r) for r in c.execute("SELECT username, created FROM users ORDER BY created")]
+
 
 class SupabaseStore:
     """消えない保存先（Supabase／無料枠あり）。Secretsに SUPABASE_URL と SUPABASE_KEY を入れると使われます。"""
@@ -235,6 +239,11 @@ class SupabaseStore:
     def delete(self, username: str):
         r = requests.delete(self.base, headers=self.h, params={"username": f"eq.{username}"}, timeout=15)
         r.raise_for_status()
+
+    def list_users(self):
+        r = requests.get(self.base, headers=self.h, params={"select": "username,created", "order": "created.asc"}, timeout=15)
+        r.raise_for_status()
+        return r.json()
 
 
 @st.cache_resource
@@ -306,6 +315,37 @@ def persist_keys():
     get_store().update(st.session_state["user"], keys_enc=token)
 
 
+def check_admin_token():
+    """管理者は、秘密のリンク（?admin=合言葉）から入ると、ログイン不要。
+    管理者用のAPIキーは、Secretsの ADMIN_ANTHROPIC_API_KEY / ADMIN_GEMINI_API_KEY から読み込みます。"""
+    if st.session_state.get("admin"):
+        return
+    token = get_secret("ADMIN_TOKEN")
+    try:
+        given = st.query_params.get("admin", "")
+    except Exception:
+        given = ""
+    if not token or not given:
+        return
+    if len(token) < 16:
+        st.warning("Secretsの ADMIN_TOKEN が短すぎます（16文字以上にしてください）。管理者としては入れません。")
+        return
+    if hmac.compare_digest(str(given), token):
+        keys = {}
+        if get_secret("ADMIN_ANTHROPIC_API_KEY"):
+            keys["Claude"] = get_secret("ADMIN_ANTHROPIC_API_KEY")
+        if get_secret("ADMIN_GEMINI_API_KEY"):
+            keys["Gemini"] = get_secret("ADMIN_GEMINI_API_KEY")
+        st.session_state["admin"] = True
+        st.session_state["user"] = "管理者"
+        st.session_state["enc_key"] = None
+        st.session_state["saved_keys"] = keys
+        try:
+            st.query_params.clear()  # 合言葉を、アドレス欄に残さない
+        except Exception:
+            pass
+
+
 def require_login():
     if st.session_state.get("user"):
         return
@@ -353,6 +393,7 @@ def require_login():
     st.stop()
 
 
+check_admin_token()
 require_login()
 
 # =====================================================================
@@ -1010,6 +1051,9 @@ def save_typed_keys():
         st.session_state["key_msg"] = ("warning", "保存するキーを、入力欄に入れてください。")
         return
     st.session_state["saved_keys"] = saved
+    if st.session_state.get("admin"):
+        st.session_state["key_msg"] = ("info", "管理者のキーは、Secretsで設定します。ここで入れたキーは、この画面の間だけ使えます。")
+        return
     try:
         persist_keys()
         st.session_state["key_msg"] = ("success", f"{'・'.join(added)} のキーを、暗号化して保存しました。")
@@ -1021,6 +1065,9 @@ def delete_saved_key(prov: str):
     saved = dict(st.session_state.get("saved_keys", {}))
     saved.pop(prov, None)
     st.session_state["saved_keys"] = saved
+    if st.session_state.get("admin"):
+        st.session_state["key_msg"] = ("info", "この画面の間だけ、キーを外しました（Secretsの設定は、そのままです）。")
+        return
     try:
         persist_keys()
         st.session_state["key_msg"] = ("success", f"{prov} のキーを削除しました。")
@@ -1035,10 +1082,14 @@ saved_keys = st.session_state.get("saved_keys", {})
 
 with st.sidebar:
     st.markdown(f"### 🔗 {APP_NAME}")
-    st.caption(f"👤 {st.session_state['user']} でログイン中")
+    is_admin = bool(st.session_state.get("admin"))
+    st.caption("👑 管理者（ログイン不要）" if is_admin else f"👤 {st.session_state['user']} でログイン中")
 
     with st.expander("🔐 マイAPIキー", expanded=not any(saved_keys.values())):
-        st.caption("あなた自身のAPIキーを使います。使った分の料金は、あなたのAPIアカウントにかかります。パスワードで暗号化して保存されます。")
+        if is_admin:
+            st.caption("管理者のキーは、Secretsの ADMIN_ANTHROPIC_API_KEY / ADMIN_GEMINI_API_KEY から読み込まれます。ここで入力したキーは、この画面の間だけ使えます。")
+        else:
+            st.caption("あなた自身のAPIキーを使います。使った分の料金は、あなたのAPIアカウントにかかります。パスワードで暗号化して保存されます。")
         for prov, how in [
             ("Claude", "キーの取得：Claude Console（console.anthropic.com）。事前にクレジットの購入が必要です。"),
             ("Gemini", "キーの取得：Google AI Studio（aistudio.google.com/apikey）。"),
@@ -1058,19 +1109,52 @@ with st.sidebar:
 
     chat_slot = st.container()  # ← AIチャットは、あとでここに描く
     st.divider()
+
+    if is_admin:
+        with st.expander("🛠️ 管理者パネル"):
+            store = get_store()
+            try:
+                users = store.list_users()
+            except Exception as e:
+                st.error(f"ユーザー一覧を読み込めませんでした：{e}")
+                users = []
+            st.caption(f"保存先：{store.name}　／　登録ユーザー：{len(users)}人")
+            if users:
+                st.dataframe(
+                    [
+                        {
+                            "ユーザー名": u["username"],
+                            "作成日": datetime.datetime.fromtimestamp(u.get("created") or 0).strftime("%Y-%m-%d"),
+                        }
+                        for u in users
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                target = st.selectbox("削除するユーザー", [u["username"] for u in users])
+                sure_u = st.checkbox("このユーザーを削除する（元に戻せません）", key="admin_sure")
+                if st.button("🗑️ ユーザーを削除", disabled=not sure_u):
+                    try:
+                        store.delete(target)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"削除できませんでした：{e}")
+            st.caption("※ 各ユーザーのパスワードとAPIキーは、管理者にも見えません。")
+
     if st.button("🔒 ログアウト", use_container_width=True):
         st.session_state.clear()
         st.rerun()
-    with st.expander("⚠️ アカウントを削除"):
-        st.caption("アカウントと、保存したAPIキーが、完全に消えます。")
-        sure = st.checkbox("本当に削除する")
-        if st.button("アカウントを削除する", disabled=not sure):
-            try:
-                get_store().delete(st.session_state["user"])
-                st.session_state.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"削除できませんでした：{e}")
+    if not is_admin:
+        with st.expander("⚠️ アカウントを削除"):
+            st.caption("アカウントと、保存したAPIキーが、完全に消えます。")
+            sure = st.checkbox("本当に削除する")
+            if st.button("アカウントを削除する", disabled=not sure):
+                try:
+                    get_store().delete(st.session_state["user"])
+                    st.session_state.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"削除できませんでした：{e}")
 
 # =====================================================================
 #  入力エリア
