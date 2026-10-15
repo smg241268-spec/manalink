@@ -1,0 +1,7 @@
+streamlit
+google-generativeai
+anthropic
+requests
+pypdf
+markdown
+cryptography
